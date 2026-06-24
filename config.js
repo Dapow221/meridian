@@ -204,6 +204,29 @@ export const config = {
     defaultBinsBelow: strategyDefaultBinsBelow,
   },
 
+  // ─── Semi-Degen Mode ────────────────────
+  // Profit "vision" gate, smart-wallet ape-with-confirm, and volume-burst scalping.
+  semiDegen: {
+    enabled:               u.semiDegenEnabled            ?? true,
+    // Entry gate: skip any trade whose projected profit can't clear this %.
+    minProjectedProfitPct: u.minProjectedProfitPct       ?? 4,
+    // Alert (do NOT hard-close) once a position's PnL crosses this %.
+    notifyPnlPct:          u.notifyPnlPct                ?? 4,
+    // Smart-wallet watcher: ape (with your Telegram confirm) when a tracked
+    // wallet buys a token whose pool clears minMcap.
+    smartWalletWatch:        u.smartWalletWatch          ?? true,
+    smartWalletMinMcap:      u.smartWalletMinMcap        ?? 100_000,
+    smartWalletMinBuySol:    u.smartWalletMinBuySol      ?? 10,    // ignore buys smaller than this (SOL)
+    smartWalletConfirm:      u.smartWalletConfirm        ?? true,  // require Telegram ✅ before deploy
+    smartWalletWatchIntervalSec: u.smartWalletWatchIntervalSec ?? 90,
+    smartWalletWideBinsAbove: u.smartWalletWideBinsAbove ?? 60,    // wide upper range to ride upside
+    smartWalletRideUpsidePct: u.smartWalletRideUpsidePct ?? 40,    // paper-sim ride: upper range = price × (1 + this%)
+    smartWalletRelaxFilters: u.smartWalletRelaxFilters   ?? true,  // smart-wallet signal can override soft screening filters
+    // Volume-burst scalp: tighten to narrow bins when 5m volume spikes.
+    volumeBurst5mUsd:      u.volumeBurst5mUsd            ?? 250_000,
+    volumeBurstBins:       u.volumeBurstBins             ?? MIN_SAFE_BINS_BELOW,
+  },
+
   // ─── Scheduling ─────────────────────────
   schedule: {
     managementIntervalMin:  u.managementIntervalMin  ?? 10,

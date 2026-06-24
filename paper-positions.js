@@ -189,38 +189,58 @@ function processCandle(candle, position) {
  */
 export async function openPaperPosition({
   pool_address,
-  deposit_amount,
+  deposit_amount,   // deposit in USD; or pass deposit_sol to convert from SOL
+  deposit_sol,      // deposit in SOL (quote token) — converted to USD via pool price
   lower_price,
   upper_price,
+  active_price,     // SDK active-bin price; defaults to range midpoint when omitted
   strategy_type = "spot",
 }) {
   const { getBinIdFromPrice } = await getDLMMHelpers();
   const poolCfg = await fetchPoolConfig(pool_address);
 
-  const { binStep, baseFeePct, protocolFeePct, tvl, name, tokenXSymbol, tokenYSymbol, currentPrice } = poolCfg;
+  const { binStep, baseFeePct, protocolFeePct, tvl, name, tokenXSymbol, tokenYSymbol, tokenYPrice, currentPrice } = poolCfg;
   const lpFeeFraction = (baseFeePct / 100) * (1 - protocolFeePct / 100);
+
+  // Deploys use "bid_ask"; the weight builder expects "bid-ask". Normalize so the
+  // distribution shape isn't silently downgraded to spot.
+  const normStrategy = String(strategy_type).replace(/_/g, "-");
+
+  // Resolve the deposit to USD. Dry-run deploys pass SOL (the quote token); the
+  // fee/IL/APR math is all USD-denominated, so convert via the quote-token price.
+  let depositUsd = deposit_amount;
+  if (depositUsd == null && deposit_sol != null) {
+    if (!(tokenYPrice > 0)) {
+      throw new Error(`Cannot convert ${deposit_sol} SOL to USD — quote-token price unavailable for ${pool_address}`);
+    }
+    depositUsd = deposit_sol * tokenYPrice;
+  }
+  if (!(depositUsd > 0)) throw new Error("openPaperPosition requires a positive deposit_amount or deposit_sol");
 
   const lowerBinId  = getBinIdFromPrice(lower_price, binStep, true);
   const upperBinId  = getBinIdFromPrice(upper_price, binStep, false);
-  const activeBinId = getBinIdFromPrice((lower_price + upper_price) / 2, binStep, true);
+
+  // Single-side SOL deploys sit entirely below the active bin (active_price = upper bound),
+  // so the active bin is NOT the midpoint. Use the real active price when provided.
+  const sdkActivePrice = active_price != null && active_price > 0 ? active_price : (lower_price + upper_price) / 2;
+  const activeBinId = getBinIdFromPrice(sdkActivePrice, binStep, true);
 
   if (lowerBinId >= upperBinId) throw new Error("lower_price must be less than upper_price");
 
   // SDK bin prices and OHLCV candle prices may differ in scale due to token decimal differences.
-  // Detect scale factor by comparing SDK midpoint to datapi current_price (which matches OHLCV scale).
-  const sdkMidPrice = (lower_price + upper_price) / 2;
-  const priceScale  = currentPrice > 0 && sdkMidPrice > 0 ? currentPrice / sdkMidPrice : 1;
+  // Detect scale factor by comparing the SDK active price to datapi current_price (OHLCV scale).
+  const priceScale  = currentPrice > 0 && sdkActivePrice > 0 ? currentPrice / sdkActivePrice : 1;
 
   // Normalized prices — consistent with OHLCV candle close/high/low values
   const normLowerPrice = lower_price * priceScale;
   const normUpperPrice = upper_price * priceScale;
-  const normEntryPrice = sdkMidPrice * priceScale; // ≈ currentPrice
+  const normEntryPrice = sdkActivePrice * priceScale; // ≈ currentPrice
 
   const numBins           = upperBinId - lowerBinId + 1;
-  const avgExistingBinTvl = tvl > 0 ? tvl / numBins : deposit_amount;
-  const weights           = buildWeights(strategy_type, lowerBinId, upperBinId, activeBinId);
+  const avgExistingBinTvl = tvl > 0 ? tvl / numBins : depositUsd;
+  const weights           = buildWeights(normStrategy, lowerBinId, upperBinId, activeBinId);
 
-  const { xUsd, yUsd } = computeInitialSplit(deposit_amount, normEntryPrice, normLowerPrice, normUpperPrice);
+  const { xUsd, yUsd } = computeInitialSplit(depositUsd, normEntryPrice, normLowerPrice, normUpperPrice);
 
   const nowSec = Math.floor(Date.now() / 1000);
   const id     = `paper-${Date.now().toString(36)}`;
@@ -230,10 +250,11 @@ export async function openPaperPosition({
     pool_address,
     pool_name:    name || pool_address.slice(0, 8),
     pair:         `${tokenXSymbol}-${tokenYSymbol}`,
-    deposit_amount,
+    deposit_amount:   depositUsd,
+    deposit_sol:      deposit_sol ?? null,
     lower_price,
     upper_price,
-    strategy_type,
+    strategy_type:    normStrategy,
     bin_step:         binStep,
     lp_fee_fraction:  lpFeeFraction,
     lower_bin_id:     lowerBinId,
@@ -267,7 +288,7 @@ export async function openPaperPosition({
   state.positions[id] = position;
   save(state);
 
-  log("paper_sim", `Opened paper position ${id}: ${position.pair} $${deposit_amount} [${lower_price}–${upper_price}] ${strategy_type}`);
+  log("paper_sim", `Opened paper position ${id}: ${position.pair} $${depositUsd.toFixed(2)}${deposit_sol != null ? ` (${deposit_sol} SOL)` : ""} [${lower_price}–${upper_price}] ${normStrategy}`);
   return formatSummary(position);
 }
 

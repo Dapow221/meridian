@@ -28,6 +28,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { openPaperPosition } from "../paper-positions.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -683,8 +684,31 @@ export async function deployPosition({
   }
 
   if (process.env.DRY_RUN === "true") {
+    // Compute the bin range exactly as a live deploy would (no RPC bin-array check).
+    const dryMinBinId = activeBin.binId - activeBinsBelow;
+    const dryMaxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
+    const dryMinPrice = Number(getPriceOfBinByBinId(dryMinBinId, actualBinStep).toString());
+    const dryMaxPrice = Number(getPriceOfBinByBinId(dryMaxBinId, actualBinStep).toString());
+
+    // Track a virtual position so the dry run exercises the full manage→close lifecycle.
+    // The 5m cron (tickPaperPositions) marks it to live OHLCV candles. Never blocks the deploy.
+    let paper = null;
+    try {
+      paper = await openPaperPosition({
+        pool_address,
+        deposit_sol: finalAmountY,
+        lower_price: dryMinPrice,
+        upper_price: dryMaxPrice,
+        active_price: activePrice,
+        strategy_type: activeStrategy,
+      });
+    } catch (e) {
+      log("deploy", `DRY RUN — paper position tracking failed: ${e.message}`);
+    }
+
     return {
       dry_run: true,
+      paper_position: paper,
       would_deploy: {
         pool_address,
         strategy: activeStrategy,
@@ -696,7 +720,9 @@ export async function deployPosition({
         amount_y: finalAmountY,
         wide_range: totalBins > 69,
       },
-      message: "DRY RUN — no transaction sent",
+      message: paper
+        ? `DRY RUN — no transaction sent. Tracking paper position ${paper.id} (use list_paper_positions / /papers).`
+        : "DRY RUN — no transaction sent",
     };
   }
 

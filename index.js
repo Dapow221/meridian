@@ -26,7 +26,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { tickPaperPositions } from "./paper-positions.js";
+import { tickPaperPositions, listPaperPositions } from "./paper-positions.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
@@ -36,6 +36,9 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { startSmartWalletWatch } from "./smart-wallet-watch.js";
+import { onSmartWalletSignal, handleApeCallback } from "./smart-ape.js";
+import { projectTradeProfit, passesProfitGate } from "./projection.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -192,10 +195,14 @@ async function maybeRunMissedBriefing() {
   await runBriefing();
 }
 
+let _smartWatchHandle = null;
+const _profitNotified = new Set(); // positions already alerted for crossing the profit floor
+
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   _cronTasks = [];
+  if (_smartWatchHandle) { _smartWatchHandle.stop(); _smartWatchHandle = null; }
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -248,6 +255,22 @@ export async function runManagementCycle({ silent = false } = {}) {
         }
         exitMap.set(p.position, exit.reason);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
+      }
+    }
+
+    // ── Semi-degen: alert (do NOT close) when PnL crosses the notify floor ──
+    // Winners ride; trailing TP handles the exit. We just ping you once.
+    if (config.semiDegen?.enabled) {
+      const floor = config.semiDegen.notifyPnlPct ?? 4;
+      for (const p of positionData) {
+        const pnl = Number(p.pnl_pct);
+        if (!Number.isFinite(pnl)) continue;
+        if (pnl >= floor && !_profitNotified.has(p.position)) {
+          _profitNotified.add(p.position);
+          sendMessage(`📈 ${p.pair} is up ${pnl.toFixed(1)}% — letting it ride (trailing TP armed at +${config.management.trailingTriggerPct}%).`).catch(() => {});
+        } else if (pnl < floor * 0.5) {
+          _profitNotified.delete(p.position); // reset so a later re-cross alerts again
+        }
       }
     }
 
@@ -640,6 +663,23 @@ export async function runScreeningCycle({ silent = false } = {}) {
         });
       }
 
+      // Semi-degen: profit "vision" + volume-burst tag for the LLM
+      if (config.semiDegen?.enabled) {
+        const burst = Number(pool.volume_window) >= (config.semiDegen.volumeBurst5mUsd ?? Infinity);
+        const proj = projectTradeProfit({
+          feeTvlRatio: pool.fee_active_tvl_ratio,
+          volume5m: pool.volume_window,
+          tvl: pool.tvl ?? pool.active_tvl,
+          activeTvl: pool.active_tvl,
+          mcap: pool.mcap,
+          narrowBins: burst,
+          smartWallet: (sw?.in_pool?.length ?? 0) > 0,
+        });
+        const gateMark = proj.projectedTotalPct >= (config.semiDegen.minProjectedProfitPct ?? 4) ? "PASS" : "BELOW FLOOR";
+        block += `\n  vision: ${proj.rationale} [${gateMark} ${config.semiDegen.minProjectedProfitPct}% floor]`;
+        if (burst) block += `\n  VOLUME BURST: 5m vol $${pool.volume_window} ≥ $${config.semiDegen.volumeBurst5mUsd} → use bins_below=${config.semiDegen.volumeBurstBins} (tight scalp)`;
+      }
+
       return block;
     });
 
@@ -656,6 +696,7 @@ PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
+0. SEMI-DEGEN GATE: only deploy a candidate whose vision line is marked PASS (projected profit ≥ ${config.semiDegen?.minProjectedProfitPct ?? 4}%). Skip any "BELOW FLOOR" candidate. For a "VOLUME BURST" candidate, set bins_below to the tight scalp value shown on its line.
 1. Decide whether any candidate is worth deploying. A single remaining candidate is not automatically good enough.
 2. Pick the best candidate only if it has real conviction from narrative quality, smart wallets, and pool metrics. If the list has only one pool and it lacks narrative or smart-wallet confirmation, skip the cycle.
 3. If a pool qualifies, call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
@@ -864,6 +905,13 @@ Summarize the current portfolio health, total fees earned, and performance of al
   _cronTasks = [mgmtTask, screenTask, healthTask, paperSimTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
+
+  // Smart-wallet ape watcher (semi-degen) — polls tracked holder wallets for buys.
+  if (_smartWatchHandle) { _smartWatchHandle.stop(); _smartWatchHandle = null; }
+  if (config.semiDegen?.enabled && config.semiDegen?.smartWalletWatch) {
+    _smartWatchHandle = startSmartWalletWatch(onSmartWalletSignal);
+  }
+
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
@@ -1020,7 +1068,13 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   return null;
 }
 
-function computeBinsBelow(volatility) {
+function computeBinsBelow(volatility, volume5m) {
+  // Semi-degen volume-burst scalp: when 5m volume spikes, tighten to narrow bins
+  // to concentrate liquidity near price and grab fees fast.
+  const sd = config.semiDegen;
+  if (sd?.enabled && volume5m != null && Number(volume5m) >= (sd.volumeBurst5mUsd ?? Infinity)) {
+    return Math.max(config.strategy.minBinsBelow, Math.round(Number(sd.volumeBurstBins ?? config.strategy.minBinsBelow)));
+  }
   const parsedVolatility = Number(volatility);
   if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
     throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
@@ -1467,6 +1521,7 @@ function formatHelpText() {
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
+    "/papers — list paper (dry-run) positions",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
@@ -1538,8 +1593,31 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
+  // ── Semi-degen: profit "vision" entry gate + volume-burst narrow bins ──
+  if (config.semiDegen?.enabled) {
+    const burst = Number(candidate.volume_window) >= (config.semiDegen.volumeBurst5mUsd ?? Infinity);
+    const gate = passesProfitGate({
+      feeTvlRatio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
+      volume5m: candidate.volume_window,
+      tvl: candidate.tvl ?? candidate.active_tvl,
+      activeTvl: candidate.active_tvl,
+      mcap: candidate.mcap,
+      narrowBins: burst,
+    });
+    if (!gate.pass) {
+      appendDecision({
+        type: "no_deploy",
+        actor: "SCREENER",
+        summary: `${candidate.name} below profit floor`,
+        reason: gate.rationale,
+        pool: candidate.pool,
+        pool_name: candidate.name,
+      });
+      throw new Error(`NO DEPLOY: ${candidate.name} — ${gate.rationale} (floor ${gate.floor}%)`);
+    }
+  }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
+  const binsBelow = computeBinsBelow(candidate.volatility, candidate.volume_window);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
     amount_y: deployAmount,
@@ -1606,6 +1684,14 @@ async function telegramHandler(msg) {
       return;
     }
     await showSettingsMenu({ messageId: menuMsgId, page });
+    return;
+  }
+  if (msg?.isCallback && (text.startsWith("ape:") || text.startsWith("skip:"))) {
+    try {
+      await handleApeCallback(msg);
+    } catch (e) {
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+    }
     return;
   }
   if (msg?.isCallback && text.startsWith("cfg:")) {
@@ -1675,6 +1761,26 @@ async function telegramHandler(msg) {
         return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
+  if (text === "/papers") {
+    try {
+      const all = listPaperPositions();
+      const open = all.filter((p) => p.status === "open");
+      const closed = all.filter((p) => p.status === "closed");
+      if (all.length === 0) { await sendMessage("No paper (dry-run) positions yet."); return; }
+      const fmt = (p) => {
+        const pnl = p.net_pnl >= 0 ? `+$${p.net_pnl}` : `-$${Math.abs(p.net_pnl)}`;
+        const ir = p.in_range_pct != null ? ` | in-range ${p.in_range_pct}%` : "";
+        const dur = p.duration_hours ? ` | ${p.duration_hours}h` : "";
+        return `• ${p.pair} (${p.strategy}) | $${p.deposit} | PnL: ${pnl} (fees $${p.fees_earned} / IL $${p.il_usd})${ir}${dur}\n  ${p.id}`;
+      };
+      const parts = [`📝 Paper Positions — ${open.length} open, ${closed.length} closed`];
+      if (open.length)   parts.push("\nOPEN:\n" + open.map(fmt).join("\n"));
+      if (closed.length) parts.push("\nCLOSED:\n" + closed.map(fmt).join("\n"));
+      await sendMessage(parts.join("\n"));
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }

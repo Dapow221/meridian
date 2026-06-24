@@ -21,6 +21,11 @@ strategy-library.json
 decision-log.json
 hivemind-cache.json
 signal-weights.json
+smart-wallet-watch.json
+paper-positions.json
+
+# Smart-wallet import source (user-specific watchlist — keep private)
+import-wallets.json
 
 # Logs
 logs/
