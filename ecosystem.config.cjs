@@ -14,6 +14,10 @@ module.exports = {
       min_uptime: "10s",
       env: {
         NODE_ENV: "production",
+        // Prefer IPv4: some hosts (e.g. VPS) have AAAA records resolvable but no
+        // working IPv6 route, which makes Node's fetch hang until ETIMEDOUT.
+        // Safe on dual-stack and IPv4-only environments.
+        NODE_OPTIONS: "--dns-result-order=ipv4first",
       },
     },
   ],
